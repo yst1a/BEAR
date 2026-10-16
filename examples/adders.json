@@ -1,0 +1,8 @@
+[
+  {
+    "module": "loa8",
+    "files": ["loa_accumulator.v"],
+    "input_ports": ["a", "b"],
+    "output_port": "y"
+  }
+]

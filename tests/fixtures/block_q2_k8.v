@@ -1,0 +1,77 @@
+module accumulator(input clk,rst_n,input [15:0] prod_in,output [31:0] y);
+wire [31:0] x={16'b0,prod_in};
+wire [7:0] lo_next = l | x[7:0];
+wire kappa = l[7] & x[7];
+reg [7:0] l;
+reg [23:0] S; reg [11:0] cb;
+wire [23:0] xh=x[31:8];
+wire [23:0] Cw;
+wire [2:0] t_0={1'b0,S[1:0]}+{1'b0,xh[1:0]}+kappa;
+assign Cw[0] = 1'b0;
+assign Cw[1:1] = '0;
+wire [2:0] t_1={1'b0,S[3:2]}+{1'b0,xh[3:2]}+cb[1];
+assign Cw[2] = cb[1];
+assign Cw[3:3] = '0;
+wire [2:0] t_2={1'b0,S[5:4]}+{1'b0,xh[5:4]}+cb[2];
+assign Cw[4] = cb[2];
+assign Cw[5:5] = '0;
+wire [2:0] t_3={1'b0,S[7:6]}+{1'b0,xh[7:6]}+cb[3];
+assign Cw[6] = cb[3];
+assign Cw[7:7] = '0;
+wire [2:0] t_4={1'b0,S[9:8]}+{1'b0,xh[9:8]}+cb[4];
+assign Cw[8] = cb[4];
+assign Cw[9:9] = '0;
+wire [2:0] t_5={1'b0,S[11:10]}+{1'b0,xh[11:10]}+cb[5];
+assign Cw[10] = cb[5];
+assign Cw[11:11] = '0;
+wire [2:0] t_6={1'b0,S[13:12]}+{1'b0,xh[13:12]}+cb[6];
+assign Cw[12] = cb[6];
+assign Cw[13:13] = '0;
+wire [2:0] t_7={1'b0,S[15:14]}+{1'b0,xh[15:14]}+cb[7];
+assign Cw[14] = cb[7];
+assign Cw[15:15] = '0;
+wire [2:0] t_8={1'b0,S[17:16]}+{1'b0,xh[17:16]}+cb[8];
+assign Cw[16] = cb[8];
+assign Cw[17:17] = '0;
+wire [2:0] t_9={1'b0,S[19:18]}+{1'b0,xh[19:18]}+cb[9];
+assign Cw[18] = cb[9];
+assign Cw[19:19] = '0;
+wire [2:0] t_10={1'b0,S[21:20]}+{1'b0,xh[21:20]}+cb[10];
+assign Cw[20] = cb[10];
+assign Cw[21:21] = '0;
+wire [2:0] t_11={1'b0,S[23:22]}+{1'b0,xh[23:22]}+cb[11];
+assign Cw[22] = cb[11];
+assign Cw[23:23] = '0;
+always @(posedge clk or negedge rst_n) begin
+ if(!rst_n) begin S<='0; cb<='0; l<='0; end
+ else begin
+  S[1:0] <= t_0[1:0];
+  cb[1] <= t_0[2];
+  S[3:2] <= t_1[1:0];
+  cb[2] <= t_1[2];
+  S[5:4] <= t_2[1:0];
+  cb[3] <= t_2[2];
+  S[7:6] <= t_3[1:0];
+  cb[4] <= t_3[2];
+  S[9:8] <= t_4[1:0];
+  cb[5] <= t_4[2];
+  S[11:10] <= t_5[1:0];
+  cb[6] <= t_5[2];
+  S[13:12] <= t_6[1:0];
+  cb[7] <= t_6[2];
+  S[15:14] <= t_7[1:0];
+  cb[8] <= t_7[2];
+  S[17:16] <= t_8[1:0];
+  cb[9] <= t_8[2];
+  S[19:18] <= t_9[1:0];
+  cb[10] <= t_9[2];
+  S[21:20] <= t_10[1:0];
+  cb[11] <= t_10[2];
+  S[23:22] <= t_11[1:0];
+  cb[0] <= 1'b0;
+  l <= lo_next;
+ end
+end
+wire [23:0] decoded = S + Cw;
+assign y = {decoded,l};
+endmodule
