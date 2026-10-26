@@ -41,7 +41,7 @@ def characterize_library(specs,out):
         files=spec['files'];module=spec.get('top',spec['module'])
         cache=out/('adder_'+str(len(certs)))
         try:
-            c=characterize(files,module,cache,input_ports=spec.get('input_ports'),output_port=spec.get('output_port'),yosys=tool('yosys'))
+            c=characterize(files,module,cache,input_ports=spec.get('input_ports'),output_port=spec.get('output_port'),yosys=tool('yosys'),max_extract_k=12,timeout=900)
         except Exception as exc:
             c=dict(module=module,status='UNKNOWN',low_local=False,error=repr(exc))
             save(cache/'FIRST_FAILURE.json',c)
@@ -55,7 +55,7 @@ def characterize_library(specs,out):
 
 def run_design(files,top,adder_specs,out,*,D=(100,2000),budgets=(1000,2000),objective='area@budget',
                certificates=None,prove_enabled=True,heavy=False,energy_enabled=False,
-               readout='every-cycle',readout_ports=(),readout_budget_ps=None,readout_contract=None,formal_engine='sby',
+               readout='every-cycle',readout_ports=(),readout_budget_ps=None,readout_contract=None,formal_engine='yosys_sat',
                pipeline_stages=None, block_size=None):
     from .verify import prove
     if energy_enabled:
@@ -67,10 +67,8 @@ def run_design(files,top,adder_specs,out,*,D=(100,2000),budgets=(1000,2000),obje
     times['characterize_s']=time.monotonic()-t;t=time.monotonic()
     detection=detect_design(files,top,certs,out/'detect')
     times['detect_s']=time.monotonic()-t;t=time.monotonic()
-    candidates={}
-    for variant in ('T_cs','T_csf','T_cs_pp','T_csf_pp','T1','T2'):
-        r=rewrite_design(detection,certs,out/'rewrite'/variant,variant=variant)
-        candidates[variant]=r
+    from .readout import generate_candidates
+    candidates=generate_candidates(detection,certs,out/'rewrite')
     if block_size:
         variant=f'T_blk_q{block_size}'
         candidates[variant]=rewrite_design(detection,certs,out/'rewrite'/variant,variant=variant)
@@ -78,6 +76,9 @@ def run_design(files,top,adder_specs,out,*,D=(100,2000),budgets=(1000,2000),obje
         from ._pipeline import rewrite_pipe_design
         r=rewrite_pipe_design(detection,certs,out/'rewrite'/'pipeline',pipeline_stages)
         candidates[r['variant']]=r
+        if block_size:
+            r=rewrite_pipe_design(detection,certs,out/'rewrite'/'block_pipeline',pipeline_stages,block_size=block_size)
+            candidates[r['variant']]=r
     times['rewrite_s']=time.monotonic()-t
     ppa=[];proofs={};ptime=0;synthtime=0
     for variant,sources in [('original',files)]+[(v,[r['rtl']]) for v,r in candidates.items() if r.get('status')=='GENERATED']:
@@ -88,6 +89,7 @@ def run_design(files,top,adder_specs,out,*,D=(100,2000),budgets=(1000,2000),obje
                     proofs[variant]=prove(files,[candidates[variant]['rtl']],top,out/'proof'/variant,
                                            refinement=candidates[variant].get('refinement'),cycles=100000,
                                            latency=candidates[variant].get('latency',0),
+                                           readout_ports=candidates[variant].get('readout_ports',[]) if candidates[variant].get('latency',0) else [],
                                            memory_mb=8192 if heavy else 3072,formal_engine=formal_engine)
                 except Exception as exc:
                     proofs[variant]=dict(status='UNKNOWN',error=repr(exc));save(out/'proof'/variant/'FIRST_FAILURE.json',proofs[variant])
@@ -127,6 +129,25 @@ def run_design(files,top,adder_specs,out,*,D=(100,2000),budgets=(1000,2000),obje
 def main(argv=None):
     parser=argparse.ArgumentParser(prog='bear',description='Bit-exact accumulator re-encoding')
     sub=parser.add_subparsers(dest='cmd',required=True)
+    p=sub.add_parser('array',help='Generate and prove shared array readout using an existing PE proof')
+    p.add_argument('--pe',nargs='+',required=True)
+    p.add_argument('--pe-proof',required=True)
+    p.add_argument('--mux',nargs='+',required=True)
+    p.add_argument('--mux-top',required=True)
+    p.add_argument('--n',type=int,required=True)
+    p.add_argument('--width',type=int,required=True)
+    p.add_argument('--k',type=int,required=True)
+    p.add_argument('--selection',choices=['binary','onehot','onehot0'],default='binary')
+    p.add_argument('--selector',nargs='+',help='Combinational controller adapter sources for a onehot proof')
+    p.add_argument('--selector-top')
+    p.add_argument('--control-width',type=int)
+    p.add_argument('--segments',type=int,default=1,help='Arithmetic segments L; latency d=M+L-1')
+    p.add_argument('--selector-stages',type=int,default=0,help='Registered selector levels M; 0 preserves the combinational selector')
+    p.add_argument('--selector-groups',help='Comma-separated selection bit counts, low bits first; default evenly split')
+    p.add_argument('--encoded-default',default='0,0,0',help='low,sum,carry')
+    p.add_argument('--original-default',type=int,default=0)
+    p.add_argument('--timeout',type=int,default=120)
+    p.add_argument('--out',required=True)
     for name in ('run','extract','characterize'):
         p=sub.add_parser(name)
         p.add_argument('files',nargs='+');p.add_argument('--top',required=True);p.add_argument('--out',required=True)
@@ -141,7 +162,7 @@ def main(argv=None):
             p.add_argument('--readout',default='every-cycle',choices=['every-cycle','on-readout'])
             p.add_argument('--readout-ports',default='')
             p.add_argument('--readout-budget-ps',type=float);p.add_argument('--readout-contract')
-            p.add_argument('--formal-engine',default='sby',choices=['sby','yosys_sat'])
+            p.add_argument('--formal-engine',default='yosys_sat',choices=['sby','yosys_sat'])
     p=sub.add_parser('reencode')
     p.add_argument('detection');p.add_argument('--certificates',required=True)
     p.add_argument('--variant',default='T_cs');p.add_argument('--out',required=True)
@@ -152,20 +173,49 @@ def main(argv=None):
     p.add_argument('--refinement',help='Candidate metadata JSON or a named refinement list')
     p.add_argument('--latency',type=int,help='Extra candidate output delay in clocks (d)')
     p.add_argument('--readout-ports',default='',help='Comma-separated delayed outputs; default: all outputs')
-    p.add_argument('--formal-engine',default='sby',choices=['sby','yosys_sat'])
+    p.add_argument('--formal-engine',default='yosys_sat',choices=['sby','yosys_sat'])
     p=sub.add_parser('select')
     p.add_argument('points',help='JSON list of technology-mapped timing/area points')
     p.add_argument('--proofs',required=True,help='JSON proof records keyed by candidate variant')
     p.add_argument('--budgets');p.add_argument('--out',required=True)
     p.add_argument('--objective',default='area@budget',choices=['area@budget','fastest'])
     p=sub.add_parser('export');p.add_argument('certificate');p.add_argument('output')
+    p=sub.add_parser('interface',help='Emit an explicit product accumulator interface')
+    p.add_argument('--top',required=True);p.add_argument('--adder-module',required=True)
+    p.add_argument('--width',type=int,default=32);p.add_argument('--input-width',type=int,default=8)
+    p.add_argument('--mode',choices=['ACC','MAC'],default='ACC')
+    p.add_argument('--product-signed',action='store_true')
+    p.add_argument('--activation-signed',action='store_true');p.add_argument('--weight-signed',action='store_true')
+    p.add_argument('--out',required=True)
     args=parser.parse_args(argv)
+    if args.cmd=='array':
+        from .array import build_array
+        default=tuple(map(int,args.encoded_default.split(',')))
+        if len(default)!=3:parser.error('--encoded-default requires low,sum,carry')
+        result=build_array(args.pe,args.pe_proof,args.mux,args.mux_top,args.n,args.width,args.k,args.out,
+                           mode=args.selection,segments=args.segments,default=default,
+                           original_default=args.original_default,timeout=args.timeout,
+                           selector_files=args.selector or (),selector_top=args.selector_top,
+                           control_width=args.control_width,selector_stages=args.selector_stages,
+                           selector_group_bits=list(map(int,args.selector_groups.split(','))) if args.selector_groups else None)
+        print(json.dumps({'status':result['status'],'scope':result['scope'],'out':args.out}))
+        if result['status']!='PASS':raise SystemExit(1)
+        return
+    if args.cmd=='interface':
+        from .input_interface import accumulator_interface_rtl, product_interface
+        options=dict(mode=args.mode,product_signed=args.product_signed,
+                     activation_signed=args.activation_signed,weight_signed=args.weight_signed)
+        metadata=product_interface(args.width,args.input_width,**options)
+        text=accumulator_interface_rtl(args.top,args.adder_module,args.width,args.input_width,**options)
+        path=Path(args.out);path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(text,encoding='utf-8')
+        print(json.dumps(dict(status='GENERATED',out=str(path),interface=metadata)));return
     if args.cmd=='export':
         from .export import export
         result=export(args.certificate,args.output)
         print(json.dumps(result));return
     if args.cmd=='characterize':
-        result=characterize(args.files,args.top,args.out,yosys=tool('yosys'))
+        result=characterize(args.files,args.top,args.out,yosys=tool('yosys'),max_extract_k=12,timeout=900)
     elif args.cmd in ('run','extract'):
         specs=library_specs(args.adders)
         if args.cmd=='run':
@@ -181,11 +231,9 @@ def main(argv=None):
     elif args.cmd=='reencode':
         certs=load(args.certificates)
         if isinstance(certs,dict):certs=certs.get('certificates',[certs])
-        if args.pipeline_stages and args.block_size:
-            parser.error('Choose either --pipeline-stages or --block-size')
         if args.pipeline_stages:
             from ._pipeline import rewrite_pipe_design
-            result=rewrite_pipe_design(load(args.detection),certs,args.out,args.pipeline_stages)
+            result=rewrite_pipe_design(load(args.detection),certs,args.out,args.pipeline_stages,block_size=args.block_size)
         else:result=rewrite_design(load(args.detection),certs,args.out,f'T_blk_q{args.block_size}' if args.block_size else args.variant)
     elif args.cmd=='verify':
         from .verify import prove
@@ -194,7 +242,7 @@ def main(argv=None):
         if 'refinement' in metadata:refinement=metadata['refinement']
         latency=args.latency if args.latency is not None else metadata.get('latency',0)
         result=prove(args.original,args.candidate,args.top,args.out,refinement=refinement,formal_engine=args.formal_engine,
-                     latency=latency,readout_ports=[p.strip() for p in args.readout_ports.split(',') if p.strip()])
+                     latency=latency,readout_ports=[p.strip() for p in args.readout_ports.split(',') if p.strip()] or metadata.get('readout_ports',[]))
     else:
         points=load(args.points)
         if args.objective=='area@budget' and not args.budgets:parser.error('area@budget requires --budgets')

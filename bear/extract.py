@@ -161,6 +161,38 @@ class NetGraph:
                 pending += [cell['connections'][p] for p in ports if p in cell['connections']]
         return sorted(found,key=lambda x:x['cell'])
 
+    def operand_interface(self, bits):
+        """Report explicit wiring extensions without inferring signed intent.
+
+        Yosys bit vectors already contain sign-bit repetitions. Recording them
+        makes a narrow product interface distinguishable from zero extension;
+        re-encoding must preserve the actual vector in either case.
+        """
+        bits = list(bits)
+        sources = [(name, "port", p["bits"]) for name, p in self.module.get("ports", {}).items()
+                   if p.get("direction") == "input"]
+        sources += [(name + "." + port, cell["type"], vector)
+                    for name, cell in self.cells.items()
+                    for port, vector in cell.get("connections", {}).items()
+                    if cell.get("port_directions", {}).get(port) == "output"
+                    and cell["type"] in ("$mul", "$add")]
+        for name, kind, vector in sorted(sources, key=lambda row: -len(row[2])):
+            n = len(vector)
+            if not 0 < n < len(bits) or bits[:n] != list(vector):
+                continue
+            suffix = bits[n:]
+            if all(b == "0" for b in suffix):
+                extension = "zero"
+            elif isinstance(vector[-1], int) and all(b == vector[-1] for b in suffix):
+                extension = "sign"
+            else:
+                continue
+            return dict(source=name, source_kind=kind, source_width=n,
+                        operand_width=len(bits), extension=extension,
+                        evidence="elaborated_bit_wiring")
+        return dict(operand_width=len(bits), extension="bit_vector",
+                    evidence="elaborated_bit_wiring")
+
 
 def analyze_netlist(netlist, top, certificates):
     started = time.monotonic()
@@ -195,6 +227,7 @@ def analyze_netlist(netlist, top, certificates):
                  "adder_type": graph.cells[adder]["type"], "width": width,
                  "operand_widths": actual, "k": k, "data_path": path,
                  "operand_paths": states, "predecessors": sorted(predecessors),
+                 "operand_interfaces": [graph.operand_interface(operands[p]) for p in inputs],
                  "rewritable": legal, "candidates": ["T_cs"] if legal else [], "reasons": reasons,
                  "location": cell.get("attributes", {}).get("src", "UNKNOWN")}
         upstream=[v for port in inputs for v in graph.upstream_arithmetic(operands[port])]

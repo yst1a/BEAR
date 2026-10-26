@@ -858,8 +858,81 @@ def _combinational(graph, module, structure, variant):
                  "quotient": quotient}
 
 
+def _accurate_baseline(graph, module, modules, variant):
+    """Replace certified leaf high arithmetic, retaining native low gates and registers."""
+    sources, accepted, refused = [], [], []
+    def ident(name):
+        return '\\' + name + ' '
+    for index, (name, cert) in enumerate(graph.adders.items()):
+        try:
+            if not cert.get('low_local') or cert.get('status', 'PASS') != 'PASS':
+                raise Unsupported('No passing low-local certificate')
+            cell = graph.cells[name]
+            inputs, output = graph.adder_ports(name)
+            native = modules[cell['type']]
+            ports = native['ports']
+            if set(ports) != set(inputs + [output]):
+                raise Unsupported('Native leaf has extra ports')
+            w = len(cell['connections'][output])
+            widths = [len(cell['connections'][p]) for p in inputs]
+            k = int(cert.get('k', cert.get('k_min', 0)))
+            if not 0 <= k < w or widths != cert.get('input_widths', [cert['width']] * 2):
+                raise Unsupported('Leaf widths or split do not match certificate')
+            if w != cert.get('output_width', cert['width']) or any(v > w for v in widths):
+                raise Unsupported('Leaf output width does not match certificate')
+            if any(ports[p].get('signed', 0) for p in ports):
+                raise Unsupported('Signed native leaf is unsupported')
+            if any(len(ports[p]['bits']) != len(cell['connections'][p]) for p in ports):
+                raise Unsupported('Native module port widths do not match instance')
+            helper = Helper('bear_' + variant + '_' + str(index), w, k)
+            a, b = [helper.port(cell['connections'][p]) for p in inputs]
+            helper.lines += [f'wire [{w-1}:0] ax={a},bx={b};']
+            if k:
+                helper.lines.append(f'wire [{w-1}:0] native_low;')
+                bindings = [f'.{ident(p)}({v} & {n}\'d{(1 << k)-1})'
+                            for p, v, n in zip(inputs, (a, b), widths)]
+                bindings.append(f'.{ident(output)}(native_low)')
+                params = cell.get('parameters', {})
+                overrides = '#(' + ','.join(f'.{ident(p)}({len(v)}\'b{v})' for p,v in params.items()) + ')' if params else ''
+                helper.lines += [f'{ident(cell["type"])} {overrides} low_impl(' + ','.join(bindings) + ');',
+                                 f'wire carry_in=native_low[{k}];']
+                aa, bb = f'ax[{w-1}:{k}]', f'bx[{w-1}:{k}]'
+            else:
+                helper.lines.append("wire carry_in=1'b0;")
+                aa, bb = 'ax', 'bx'
+            h = w-k
+            helper.lines += [f"wire [{h}:0] ha={{{aa},1'b1}},hb={{{bb},carry_in}};"]
+            adder = _prefix_readout if variant == 'B_pp' else _select_readout
+            summ = adder(helper.lines, 'ha', 'hb', h+1, 'accurate')
+            expr = '{' + summ + f'[{h}:1],native_low[{k-1}:0]' + '}' if k else summ + f'[{h}:1]'
+            helper.ports.append(f'output [{w-1}:0] q')
+            helper.connections['q'] = cell['connections'][output]
+            helper.lines.append(f'assign q={expr};')
+            sources.append(f'module {helper.name}(' + ','.join(helper.ports) + ');\n' + '\n'.join(helper.lines) + '\nendmodule\n')
+            module['cells'][name] = _cell(helper)
+            accepted.append(name)
+        except (Unsupported, KeyError, ValueError) as exc:
+            refused.append({'cell': name, 'reason': str(exc)})
+    return sources, [], accepted, refused
+
+
 def rewrite_design(detection, certificates, out_dir, variant="T_cs", runner=None, yosys=None):
     """Reencode."""
+    if '_pipeL' in variant:
+        from .readout import pipeline_candidate
+        base,L=variant.rsplit('_pipeL',1)
+        generated=rewrite_design(detection,certificates,Path(out_dir)/'base',base,runner=runner,yosys=yosys)
+        if generated.get('status')!='GENERATED':return {**generated,'variant':variant}
+        try:
+            result=pipeline_candidate(generated['rtl'],detection['top'],int(L),out_dir,variant=variant,runner=runner,yosys=yosys)
+        except ValueError as exc:return dict(status='SKIPPED',variant=variant,reason=str(exc))
+        result['refinement']=generated.get('refinement',[])
+        from .native_block import save
+        save(Path(out_dir)/'REWRITE.json',result)
+        return result
+    if variant in ('R_blk_b2','R_blk_b4'):
+        from .native_block import rewrite_native_block
+        return rewrite_native_block(detection,certificates,out_dir,variant,runner=runner,yosys=yosys)
     from .runtime import run_guarded, tool
     started = time.monotonic()
     runner, yosys = runner or run_guarded, yosys or tool("yosys")
@@ -867,7 +940,7 @@ def rewrite_design(detection, certificates, out_dir, variant="T_cs", runner=None
     out.mkdir(parents=True, exist_ok=True)
     if detection.get("status") != "PASS":
         return {"status": "SKIPPED", "variant": variant, "reason": "Extraction did not pass"}
-    if variant not in ("T_blk_q2", "T_blk_q4", "T_cs", "T_csf", "T_cs_pp", "T_csf_pp", "T_pcs", "T_pcs_pp", "T_pcs_sel", "T_tree", "T_tree_pp", "T_tree_sel", "T_cs_sel", "T1", "T2"):
+    if variant not in ("B_pp", "B_sel", "T_blk_q2", "T_blk_q4", "T_cs", "T_csf", "T_cs_pp", "T_csf_pp", "T_pcs", "T_pcs_pp", "T_pcs_sel", "T_tree", "T_tree_pp", "T_tree_sel", "T_cs_sel", "T1", "T2"):
         return {"status": "SKIPPED", "variant": variant, "reason": "Candidate is not implemented"}
     net = json.loads(Path(detection["graph_json"]).read_text(encoding='utf-8'))
     full = json.loads(Path(detection["elaborated_json"]).read_text(encoding='utf-8'))
@@ -878,8 +951,27 @@ def rewrite_design(detection, certificates, out_dir, variant="T_cs", runner=None
         if name != top:
             net['modules'][name] = deepcopy(original_module)
     sources, mappings, refused, accepted = [], [], [], []
+    # Reject before any variant can emit a zero-split design with a lost carry.
+    for cell, cert in graph.adders.items():
+        if cert.get('k',cert.get('k_min')) == 0:
+            values=cert.get('kappa')
+            while isinstance(values,(list,tuple)) and len(values)==1:
+                values=values[0]
+            if hasattr(values,'size') and values.size==1: values=values.item()
+            if not isinstance(values,(int,float,bool)) or values != 0:
+                refused.append({'cell':cell,'reason':'K0_NONZERO_OR_UNKNOWN_KAPPA_UNSUPPORTED'})
+    if refused:
+        result={'status':'SKIPPED','variant':variant,
+                'reason':'k=0 requires a proven zero constant kappa; nonzero/unknown kappa is unsupported',
+                'rejected':refused}
+        temporary=out/'REWRITE.json.tmp'
+        temporary.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+        temporary.replace(out/'REWRITE.json')
+        return result
     try:
-        if variant.startswith('T_blk_q') or variant in ("T_cs", "T_csf", "T_cs_pp", "T_csf_pp", "T_pcs", "T_pcs_pp", "T_pcs_sel", "T_tree", "T_tree_pp", "T_tree_sel", "T_cs_sel"):
+        if variant in ('B_pp', 'B_sel'):
+            sources, mappings, accepted, refused = _accurate_baseline(graph, module, net['modules'], variant)
+        elif variant.startswith('T_blk_q') or variant in ("T_cs", "T_csf", "T_cs_pp", "T_csf_pp", "T_pcs", "T_pcs_pp", "T_pcs_sel", "T_tree", "T_tree_pp", "T_tree_sel", "T_cs_sel"):
             sources, mappings, accepted, refused = _sequential(graph, module, detection.get("stages", []), variant.startswith(("T_csf","T_pcs","T_tree")), "select" if variant.endswith("_sel") else variant.endswith("_pp"), product_csa=variant.startswith(("T_pcs","T_tree")), block_size=int(variant[-1]) if variant.startswith('T_blk_q') else None)
             if variant.startswith("T_pcs") and not any(m.get("encoding_role")=="UPSTREAM_EXACT_REGISTER" for m in mappings):
                 return {"status":"SKIPPED","variant":variant,"reason":"No upstream accurate arithmetic register can be re-encoded","rejected":refused}

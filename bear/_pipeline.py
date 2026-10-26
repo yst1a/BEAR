@@ -994,19 +994,56 @@ def _pipe_helpers(helpers_text, pipe_l):
     return "".join(out), count
 
 
-def rewrite_pipe_design(detection, certificates, out_dir, pipe_l=2, runner=None, yosys=None):
+def _pipe_block_helpers(text, pipe_l):
+    """Pipeline only the block decoder, retaining its exposed state and update."""
+    from .array import readout_rtl
+    count = 0
+    def transform(match):
+        nonlocal count
+        core = match.group(0)
+        hm = re.search(r'reg \[(\d+):0\] S;',core)
+        km = re.search(r'reg \[(\d+):0\] l;',core)
+        if not hm:
+            return core
+        h = int(hm.group(1))+1
+        k = int(km.group(1))+1 if km else 0
+        body = readout_rtl(1,h+k,k,'unused_mux',segments=pipe_l)
+        body = body[body.index('wire ['):body.rindex('endmodule')]
+        body = re.sub(r'assign selection_valid=.*?;', '', body)
+        body = re.sub(r'unused_mux .*?select_low.*?;', 'assign selected_low='+('l;' if k else "1'b0;"),body)
+        body = re.sub(r'unused_mux .*?select_sum.*?;', 'assign selected_sum=S;',body)
+        body = re.sub(r'unused_mux .*?select_carry.*?;', 'assign selected_carry=Cw;',body)
+        body = "wire [31:0] tag=0; wire [31:0] tag_out;\n"+body
+        core = re.sub(r'assign y = .*?;', '',core)
+        count += 1
+        return core.replace('endmodule',body+'endmodule')
+    text = re.sub(r'module bear_state_\w+_core\(.*?endmodule',transform,text,flags=re.S)
+    if not count:
+        raise Unsupported('No block decoder found')
+    return text,count
+
+
+
+
+def rewrite_pipe_design(detection, certificates, out_dir, pipe_l=2, runner=None, yosys=None, block_size=None):
     """ pipeline."""
+    from .reencode import rewrite_design
     if pipe_l not in (2, 3):
         raise ValueError("pipe_l must be 2 or 3")
     from .runtime import run_guarded, tool
     out = Path(out_dir).resolve(); out.mkdir(parents=True, exist_ok=True)
+    base_variant = f"T_blk_q{block_size}" if block_size else "T_cs"
+    variant = f"{base_variant}_pipe{pipe_l}"
     base_dir = out / "base_tcs"
-    base = rewrite_design(detection, certificates, base_dir, variant="T_cs", runner=runner, yosys=yosys)
+    base = rewrite_design(detection, certificates, base_dir, variant=base_variant, runner=runner, yosys=yosys)
     if base.get("status") != "GENERATED":
-        return {"status":"SKIPPED", "variant":f"T_cs_pipe{pipe_l}", "reason":"Base T_cs candidate was not generated", "base":base}
+        return {"status":"SKIPPED", "variant":variant, "reason":"Base T_cs candidate was not generated", "base":base}
     helpers = Path(base["refinement"][0].get("helper_file", base_dir/"helpers.v")) if base.get("refinement") else base_dir/"helpers.v"
     helpers = base_dir / "helpers.v"
-    transformed, n = _pipe_helpers(helpers.read_text(encoding="utf-8"), pipe_l)
+    try:
+        transformed, n = (_pipe_block_helpers if block_size else _pipe_helpers)(helpers.read_text(encoding="utf-8"), pipe_l)
+    except (Unsupported, ValueError) as exc:
+        return dict(status='SKIPPED', variant=variant, reason=str(exc), base=base)
     helperfile = out / "helpers.v"; helperfile.write_text(transformed, encoding="utf-8")
     modified = base_dir / "modified.json"
     rtlfile = out / "candidate.v"
@@ -1016,11 +1053,11 @@ def rewrite_pipe_design(detection, certificates, out_dir, pipe_l=2, runner=None,
                                   "check -assert", "write_verilog -noattr "+_quote(rtlfile)])+"\n", encoding="utf-8")
     rec = (runner or run_guarded)([str(yosys or tool("yosys")), "-Q", "-s", str(script)], cwd=out, log=out/"rewrite.log", timeout=600)
     result = {"status":"GENERATED" if rec.get("returncode")==0 and rtlfile.exists() else rec.get("status","UNKNOWN_GENERATION"),
-              "variant":f"T_cs_pipe{pipe_l}", "pipe_l":pipe_l, "pipe_helpers":n,
+              "variant":variant, "pipe_l":pipe_l, "pipe_helpers":n,
               # Segment count L corresponds to d=L-1 extra clocks in verify.
               "latency":pipe_l-1, "refinement":base.get('refinement'),
               "rtl":str(rtlfile), "base":base, "tool":rec,
-              "proof_status":"NOT_ASSESSED", "readout_contract":"q(t)=T_cs_q(t-(L-1)); all output paths set_output_delay 0"}
+              "proof_status":"NOT_ASSESSED", "readout_contract":"Readout equals the original readout through a d=L-1 stage reference delay line cleared on every reset; all output paths set_output_delay 0"}
     if rtlfile.exists(): result["rtl_sha256"] = hashlib.sha256(rtlfile.read_bytes()).hexdigest()
     (out/"REWRITE.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result

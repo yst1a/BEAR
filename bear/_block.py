@@ -1,15 +1,22 @@
 """Block carry-retaining accumulator generation."""
 
 def block_accumulator_rtl(top: str, b: int, k: int = 0, width: int = 32, input_width: int = 16,
-                          *, enable=False, low_function=None, expose_state=False) -> str:
+                          *, enable=False, low_function=None, expose_state=False,
+                          signed_input=False) -> str:
     """Emit a reset-zero accumulator with registered cross-block carries."""
     if b not in (2, 4) or not 0 <= k < width or not 0 < input_width <= width:
         raise ValueError("Require b=2 or 4, 0 <= k < width, and 0 < input_width <= width")
+    if type(signed_input) is not bool:
+        raise ValueError("signed_input must be a bool")
+    if k == 0 and low_function:
+        raise ValueError('K0_CUSTOM_LOW_FUNCTION_UNSUPPORTED: use the implicit zero carry only')
     W = width
     H = W - k
     n = (H + b - 1) // b
     lines = [f"module {top}(input clk,rst_n,input [{input_width-1}:0] prod_in,output [{W-1}:0] y);",
              f"wire [{W-1}:0] x={{{W-input_width}'b0,prod_in}};" if input_width<W else f"wire [{W-1}:0] x=prod_in;"]
+    if signed_input and input_width < W:
+        lines[1] = f"wire [{W-1}:0] x=" + "{{" + str(W-input_width) + "{prod_in[" + str(input_width-1) + "]}},prod_in};"
     extra=(',input en' if enable else '')
     if expose_state:
         extra+=f',output [{H-1}:0] os,oc'+(f',output [{k-1}:0] ol' if k else '')
@@ -49,5 +56,11 @@ def block_accumulator_rtl(top: str, b: int, k: int = 0, width: int = 32, input_w
               ("assign y = {decoded,l};" if k else "assign y = decoded;"), "endmodule", ""]
     if expose_state:
         lines.insert(-2,'assign os=S; assign oc=Cw;'+(' assign ol=l;' if k else ''))
+    if signed_input and k:
+        # Icarus requires a variable to be declared before a net initializer
+        # uses it. Keep the legacy default emission byte-compatible.
+        declaration=f"reg [{k-1}:0] l;"
+        lines.remove(declaration)
+        lines.insert(2,declaration)
     return "\n".join(lines)
 

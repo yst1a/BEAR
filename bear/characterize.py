@@ -142,6 +142,14 @@ def characterize_table(table, width, output_width=None, *, input_widths=None, al
         B = 1 << k
         mismatch = residual != residual[xs % B, ys % B]
         if not mismatch.any():
+            low = F[:B, :B]
+            nonbit = (low >> (k+1)) != 0
+            if nonbit.any():
+                a, b = map(int, np.argwhere(nonbit)[0])
+                failed.append({'k': k, 'reason': 'KAPPA_NOT_ONE_BIT',
+                               'x': a, 'y': b, 'output': int(low[a, b]),
+                               'kappa': int(low[a, b] >> k)})
+                continue
             k_found = k
             break
         x_prime, y_prime = map(int, np.argwhere(mismatch)[0])
@@ -348,6 +356,27 @@ endmodule\n''', encoding="utf-8")
     return {"k": k, "status": "FAIL", "counterexample": counter, "log": str(log)}
 
 
+def _sat_onebit(files, top, ev, k, out, yosys, runner, timeout):
+    """Prove all output bits above k zero on the native low-input domain."""
+    wa, wb = ev.input_widths
+    ow = ev.output_width
+    miter, log = out / f'onebit_k{k}.v', out / f'onebit_k{k}.log'
+    a, b = ev.inputs
+    miter.write_text(f'''module bear_onebit(input [{wa-1}:0] x, input [{wb-1}:0] y, output bad);
+wire [{ow-1}:0] f;
+{top} u(.{a}(x & {wa}'d{(1 << min(k,wa))-1}), .{b}(y & {wb}'d{(1 << min(k,wb))-1}), .{ev.output}(f));
+assign bad=|(f >> {k+1});
+endmodule
+''', encoding='utf-8')
+    script = f"read_verilog -sv {' '.join(_q(f.resolve()) for f in files)} {_q(miter)}; hierarchy -top bear_onebit; proc; flatten; delete t:$scopeinfo; opt; memory_map; opt; techmap; opt; sat -prove bad 0 -show-inputs -show-outputs"
+    run = _runner([yosys, '-Q', '-T', '-p', script], out, log, runner, timeout)
+    if isinstance(run, dict) and run.get('log'):
+        log = Path(run['log'])
+    text = log.read_text(encoding='utf-8', errors='replace')
+    status = 'PASS' if 'SAT proof finished - no model found: SUCCESS!' in text else 'FAIL' if 'SAT proof finished - model found: FAIL!' in text else 'UNKNOWN'
+    return {'status': status, 'log': str(log), 'evidence': 'SAT_LOW_INPUT_DOMAIN'}
+
+
 def _characterize_impl(files, top, out, *, input_ports=None, output_port=None, yosys="yosys",
                  exhaustive_width=12, max_extract_k=10, samples=100000,
                  seed=20261007, runner=None, timeout=300, algebra_limit=256):
@@ -382,6 +411,15 @@ def _characterize_impl(files, top, out, *, input_ports=None, output_port=None, y
             check = _sat_locality(files, top, ev, k, out, yosys, runner, timeout)
             checks.append(check)
             if check["status"] == "PASS":
+                onebit = _sat_onebit(files, top, ev, k, out, yosys, runner, timeout)
+                check['onebit'] = onebit
+                if onebit['status'] == 'FAIL':
+                    check.update(status='FAIL', reason='KAPPA_NOT_ONE_BIT', locality_status='PASS')
+                    continue
+                if onebit['status'] != 'PASS':
+                    check.update(status='UNKNOWN', reason='KAPPA_ONE_BIT_UNKNOWN', locality_status='PASS')
+                    unknown = True
+                    break
                 k_found = k
                 break
             if check["status"] == "UNKNOWN":

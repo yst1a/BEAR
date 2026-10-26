@@ -156,6 +156,8 @@ def _q_bits(module):
 def _identity_initial_domain(original_bits,candidate_bits,om,tm):
     """Verify."""
     oi,ti,tq=_init_bits(om),_init_bits(tm),_q_bits(tm)
+    if len(original_bits) != len(candidate_bits):
+        return 'INITIAL_DOMAIN_NOT_COVERED'
     assigned={}
     for a,b in zip(original_bits,candidate_bits):
         ov=oi.get(a,a if isinstance(a,str) and a in ('0','1') else None)
@@ -165,9 +167,11 @@ def _identity_initial_domain(original_bits,candidate_bits,om,tm):
                 return 'INITIAL_DOMAIN_NOT_COVERED'
         elif b not in tq:
             return 'INITIAL_DOMAIN_UNKNOWN'
-        elif ov is None:
-            if b in assigned and assigned[b]!=a:return 'INITIAL_DOMAIN_NOT_COVERED'
-            assigned[b]=a
+        else:
+            required=('constant',ov) if ov is not None else ('original',a)
+            if b in assigned and assigned[b]!=required:
+                return 'INITIAL_DOMAIN_NOT_COVERED'
+            assigned[b]=required
     return 'PASS'
 
 
@@ -419,7 +423,7 @@ def prove(original, candidate, top, out, *, source_files=None, candidate_files=N
                      **({'candidate_q_name':'u.'+r['candidate_q_name']} if 'candidate_q_name' in r else {})}
                     for r in (refinement or [])]
         result.update(latency=latency,readout_ports=readout_ports,
-                      alignment=f'candidate(t)=original(t-{latency})')
+                      alignment=f'Candidate readout equals the original readout through a {latency}-stage reference delay line cleared on every reset')
     if om is None or tm is None:
         result['reason'] = 'Proof frontend failed; see the first failure log'
     elif {p:(v['direction'],len(v['bits'])) for p,v in om['ports'].items()} != {p:(v['direction'],len(v['bits'])) for p,v in tm['ports'].items()}:
@@ -490,12 +494,23 @@ def prove(original, candidate, top, out, *, source_files=None, candidate_files=N
                 status=('PASS' if rec['returncode']==0 and 'Induction step proven: SUCCESS!' in txt else
                         'FAIL' if 'SAT proof finished - model found: FAIL!' in txt or
                         'SAT temporal induction proof finished - model found for base case: FAIL!' in txt or
-                        'FAIL: proof for base case failed!' in txt else 'UNKNOWN')
+                        'FAIL: proof for base case failed!' in txt or
+                        'ERROR: Called with -verify and proof did fail!' in txt else 'UNKNOWN')
                 result['formal']={'status':status,'raw_status':rec.get('status'),
                                   'method':'YOSYS_SAT_K_INDUCTION_MAXSTEPS'+str(depth),'execution':rec}
         else:
             (out/'cec.ys').write_text(formal_read+'memory_map\nchformal -lower\nopt\nsat -verify -prove-asserts -show-inputs\n', encoding='utf-8')
             rec=run_guarded([tool('yosys'),'-s','cec.ys'],cwd=out,log=out/'cec.log',timeout=timeout,memory_mb=memory_mb)
+            # Legacy Yosys already emits $assert cells and has no chformal -lower.
+            # Retry only that exact frontend incompatibility; preserve the first log/script.
+            if rec['returncode'] and 'chformal -lower' in rec.get('stdout','') and 'Unknown option' in rec['stdout']:
+                result['legacy_assert_frontend']=rec
+                (out/'cec.log').rename(out/'cec_unsupported_lower.log')
+                rec['log']=str(out/'cec_unsupported_lower.log')
+                text=(out/'cec.ys').read_text(encoding='utf-8')
+                (out/'cec_unsupported_lower.ys').write_text(text,encoding='utf-8')
+                (out/'cec.ys').write_text(text.replace('chformal -lower\n',''),encoding='utf-8')
+                rec=run_guarded([tool('yosys'),'-s','cec.ys'],cwd=out,log=out/'cec.log',timeout=timeout,memory_mb=memory_mb)
             txt=rec.get('stdout','')
             status='PASS' if rec['returncode']==0 and 'SUCCESS' in txt else 'FAIL' if 'proof did fail' in txt or 'FAIL!' in txt else 'UNKNOWN'
             result['formal']={'status':status,'method':'FULL_DOMAIN_COMBINATIONAL_CEC','execution':rec}

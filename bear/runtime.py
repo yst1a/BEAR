@@ -34,16 +34,33 @@ def run_guarded(args, cwd=None, log=None, timeout=None, memory_mb=None,
     started = time.monotonic()
     args = list(map(str, args))
     timed = False
+    preserve_group = os.name == 'posix' and os.environ.get('BEAR_PRESERVE_JOB_GROUP') == '1'
     try:
         with log.open('wb') as stream:
             process = subprocess.Popen(args, cwd=cwd, stdout=stream,
                                        stderr=subprocess.STDOUT,
                                        env={**ENV, **(env or {})},
-                                       start_new_session=os.name == 'posix')
+                                       start_new_session=os.name == 'posix' and not preserve_group)
             try:
                 process.wait(timeout=timeout or 3600)
             except subprocess.TimeoutExpired:
-                if os.name == 'posix':
+                if preserve_group:
+                    # Keep all tools inside the caller's existing
+                    # process group. On timeout, kill this tool's subtree only.
+                    table = subprocess.check_output(['ps', '-eo', 'pid=,ppid='], text=True)
+                    pairs = [tuple(map(int, line.split())) for line in table.splitlines() if line.strip()]
+                    descendants = {process.pid}
+                    while True:
+                        grown = descendants | {child for child, parent in pairs if parent in descendants}
+                        if grown == descendants:
+                            break
+                        descendants = grown
+                    for pid in sorted(descendants, reverse=True):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                elif os.name == 'posix':
                     os.killpg(process.pid, signal.SIGKILL)
                 else:
                     process.kill()

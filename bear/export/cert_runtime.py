@@ -123,6 +123,23 @@ class CertificateAccumulator(torch.nn.Module):
             p=(A[:,i:i+1].long()*B[:,i].long()[None,:])&((1<<self.width)-1)
             acc=self.step(acc.int(),p.int())
         return torch.where(acc>=1<<(self.width-1),acc-(1<<self.width),acc).int()
+    def product_step(self,acc,product,product_width,*,signed_input=False,signed_output=True):
+        """Extend a narrow product before the certified full-width operation.
+
+        Accept numeric products or raw product bit patterns. This is separate
+        from step(signed=...), which controls only the output interpretation.
+        """
+        self._check(acc,product)
+        if self.input_widths!=[self.width,self.width]:
+            raise UnsupportedCertificate('PRODUCT_INTERFACE_REQUIRES_FULL_WIDTH_CERTIFICATE')
+        if type(product_width) is not int or not 0<product_width<=self.width:
+            raise ValueError('PRODUCT_WIDTH_OUT_OF_RANGE')
+        if type(signed_input) is not bool or type(signed_output) is not bool:
+            raise ValueError('SIGNED_FLAGS_REQUIRE_BOOL')
+        p=product.long()&((1<<product_width)-1)
+        if signed_input:
+            p=torch.where(p>=(1<<(product_width-1)),p-(1<<product_width),p)
+        return self.step(acc,p.int(),signed=signed_output)
     def prefix(self,products,initial=0,product_first=False):
         if products.dtype!=torch.int32 or products.ndim!=1 or products.device!=self.table.device:raise ValueError('PREFIX_REQUIRES_MATCHED_1D_INT32')
         if triton is None: raise ImportError('CUDA prefix requires Triton')
